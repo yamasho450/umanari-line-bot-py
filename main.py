@@ -5,7 +5,8 @@ import hmac
 import hashlib
 import base64
 import traceback
-from typing import Dict, List, Tuple, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Tuple, Optional, Set
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,18 +27,21 @@ HEADERS = {
 }
 
 MARKS = {"◎", "○", "▲", "△", "●"}
+TRACKS = ["京都", "東京", "中山", "阪神", "小倉", "福島", "新潟"]
 
-# ===== Cache（場×日付で5分）=====
+JST = timezone(timedelta(hours=9))
+
+# ===== Cache（汎用）=====
 CACHE_TTL = 5 * 60  # seconds
 _cache: Dict[str, Tuple[float, dict]] = {}  # key -> (timestamp, data)
 
 
-def cache_get(key: str) -> Optional[dict]:
+def cache_get(key: str, ttl: int = CACHE_TTL) -> Optional[dict]:
     v = _cache.get(key)
     if not v:
         return None
     ts, data = v
-    if time.time() - ts > CACHE_TTL:
+    if time.time() - ts > ttl:
         _cache.pop(key, None)
         return None
     return data
@@ -80,11 +84,24 @@ def normalize_line(s: str) -> str:
     return s.strip()
 
 
-# ===== 日付変換 =====
+# ===== 今日/明日 → YYYY-MM-DD =====
+def resolve_day_token(tok: Optional[str]) -> Optional[str]:
+    if not tok:
+        return None
+    tok = tok.strip()
+    now = datetime.now(JST).date()
+    if tok == "今日":
+        return now.strftime("%Y-%m-%d")
+    if tok == "明日":
+        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    return None
+
+
+def is_ymd(s: str) -> bool:
+    return re.match(r"^\d{4}-\d{2}-\d{2}$", s.strip()) is not None
+
+
 def ymd_to_md(date_ymd: str) -> Optional[str]:
-    """
-    '2026-02-08' -> '2/8'
-    """
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", date_ymd.strip())
     if not m:
         return None
@@ -93,16 +110,52 @@ def ymd_to_md(date_ymd: str) -> Optional[str]:
     return f"{mm}/{dd}"
 
 
+# ===== 解析表（予想）カテゴリから、指定日の開催場を自動検出 =====
+def detect_tracks_for_date(date_ymd: str) -> List[str]:
+    """
+    カテゴリ一覧のリンクテキストに M/D と「<場> 解析表（予想）」があるものを拾う
+    """
+    md = ymd_to_md(date_ymd)
+    if not md:
+        return []
+
+    cache_key = f"tracks_for:{date_ymd}"
+    cached = cache_get(cache_key, ttl=10 * 60)  # 10分キャッシュ
+    if cached:
+        return cached["tracks"]
+
+    base = "https://www.umanari-ai.com/archives/cat_10152.html"
+    pages = [base] + [f"{base}?p={i}" for i in range(2, 10)]
+
+    found: Set[str] = set()
+
+    for url in pages:
+        r = requests.get(url, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for a in soup.select("a"):
+            t = normalize_line(a.get_text() or "")
+            if md not in t:
+                continue
+            for tr in TRACKS:
+                if (tr in t) and ("解析表（予想）" in t):
+                    found.add(tr)
+
+        # ある程度見つかったら早期終了
+        if len(found) >= 3:
+            break
+
+    tracks = [tr for tr in TRACKS if tr in found]
+    cache_set(cache_key, {"tracks": tracks})
+    return tracks
+
+
 # ===== 解析表（予想）記事URL取得（カテゴリ一覧から）=====
 def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
-    """
-    date_ymdあり：リンクテキストに「M/D」と「<場> 解析表（予想）」が両方入る記事
-    date_ymdなし：最新の「<場> 解析表（予想）」記事
-    """
     md = ymd_to_md(date_ymd) if date_ymd else None
     base = "https://www.umanari-ai.com/archives/cat_10152.html"
-    pages = [base] + [f"{base}?p={i}" for i in range(2, 10)]  # 1〜9ページ検索（多少余裕）
-
+    pages = [base] + [f"{base}?p={i}" for i in range(2, 10)]
     key = f"{track} 解析表（予想）"
 
     for cat_url in pages:
@@ -110,7 +163,6 @@ def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # 指定日がある場合：mdも含めて一致
         if md:
             for a in soup.select("a"):
                 t = normalize_line(a.get_text() or "")
@@ -122,7 +174,6 @@ def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
                         return href
                     return requests.compat.urljoin(cat_url, href)
         else:
-            # 指定日がない場合：最初に見つかった最新
             for a in soup.select("a"):
                 t = normalize_line(a.get_text() or "")
                 if key in t:
@@ -161,7 +212,6 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
     lines = [normalize_line(x) for x in raw_text.splitlines()]
     lines = [x for x in lines if x]
 
-    # "京都 11R" / "京都11R" 対応
     sec_re = re.compile(rf"^{re.escape(track)}\s*(\d{{1,2}})\s*R\b")
 
     races: Dict[int, List[dict]] = {}
@@ -219,19 +269,16 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
         if line == "馬名 勝率 爆走":
             continue
 
-        # 馬番だけの行
         if re.fullmatch(r"\d{1,2}", line):
             flush_pending()
             pending_no = int(line)
             continue
 
-        # 馬番 + 何かの行
         m = re.match(r"^(\d{1,2})\s*,?\s*(.+)$", line)
         if m:
             flush_pending()
             pending_no = int(m.group(1))
             rest = m.group(2).strip()
-
             ms = extract_marks_from_text(rest)
             if ms:
                 pending_marks.extend(ms[: 2 - len(pending_marks)])
@@ -242,10 +289,8 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
                 pending_name_parts.append(rest)
             continue
 
-        # pending中（馬名 or 印）
         if pending_no is not None:
             ms = extract_marks_from_text(line)
-
             only_marks = normalize_line("".join(ch for ch in line if ch in MARKS))
             if ms and only_marks == normalize_line(line.replace(" ", "")):
                 pending_marks.extend(ms[: 2 - len(pending_marks)])
@@ -260,8 +305,6 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
 
             pending_name_parts.append(line)
             continue
-
-        continue
 
     if current_r is not None:
         flush_pending()
@@ -288,10 +331,7 @@ def pad2(n: int) -> str:
 
 
 def format_race_table(rows: List[dict], mode: str = "両方") -> str:
-    """
-    mode: 両方 / 勝率 / 爆走
-    """
-    name_w = 12  # 目安（長すぎると崩れるので）
+    name_w = 12
     lines = []
     if mode == "勝率":
         lines.append("No  馬名            勝")
@@ -346,16 +386,12 @@ def build_all_races_text(track: str, date_ymd: Optional[str], article_url: str, 
 def split_for_line(text: str, max_len: int = 4400) -> List[str]:
     if len(text) <= max_len:
         return [text]
-
-    parts = []
-    buf = []
-    buf_len = 0
+    parts, buf, buf_len = [], [], 0
     for line in text.split("\n"):
         add = line + "\n"
         if buf_len + len(add) > max_len and buf:
             parts.append("".join(buf).rstrip())
-            buf = []
-            buf_len = 0
+            buf, buf_len = [], 0
         buf.append(add)
         buf_len += len(add)
     if buf:
@@ -363,11 +399,84 @@ def split_for_line(text: str, max_len: int = 4400) -> List[str]:
     return parts
 
 
-# ===== コマンド解析（リッチメニューは「テキスト送信」でOK）=====
+# ===== 激熱抽出（勝率◎ and 爆走◎ が同一馬に付くレース）=====
+def find_gekiatsu(date_ymd: str) -> dict:
+    """
+    return: {
+      "date": date_ymd,
+      "tracks": [
+        {"track": "京都", "article_url": "...", "races": [
+            {"race_no": 11, "horses":[{"no":2,"name":"..."}]}
+        ]},
+        ...
+      ]
+    }
+    """
+    cache_key = f"gekiatsu:{date_ymd}"
+    cached = cache_get(cache_key, ttl=5 * 60)
+    if cached:
+        return cached
+
+    tracks = detect_tracks_for_date(date_ymd)
+    results = []
+
+    for tr in tracks:
+        try:
+            d = get_umanari(tr, date_ymd=date_ymd)
+            article_url = d["article_url"]
+            races = d["races"]
+        except Exception:
+            continue
+
+        hit_races = []
+        for rno, rows in races.items():
+            horses = []
+            for r in rows:
+                if (r.get("win") == "◎") and (r.get("bakusou") == "◎"):
+                    horses.append({"no": r["no"], "name": r["name"]})
+            if horses:
+                hit_races.append({"race_no": rno, "horses": horses})
+
+        if hit_races:
+            hit_races.sort(key=lambda x: x["race_no"])
+            results.append({"track": tr, "article_url": article_url, "races": hit_races})
+
+    out = {"date": date_ymd, "tracks": results}
+    cache_set(cache_key, out)
+    return out
+
+
+def format_gekiatsu_text(date_ymd: str) -> str:
+    g = find_gekiatsu(date_ymd)
+    tracks = g["tracks"]
+
+    out = [f"激熱レース（勝率◎×爆走◎） {date_ymd}", ""]
+
+    if not tracks:
+        out.append("該当なし（勝率◎と爆走◎が同一馬に付くレースが見つかりませんでした）")
+        return "\n".join(out).strip()
+
+    for t in tracks:
+        out.append(f"■ {t['track']}")
+        out.append(t["article_url"])
+        for rr in t["races"]:
+            horses = " / ".join([f"{pad2(h['no'])} {h['name']}" for h in rr["horses"]])
+            out.append(f"  {t['track']}{rr['race_no']}R：{horses}")
+        out.append("")
+
+    return "\n".join(out).strip()
+
+
+# ===== コマンド解析（リッチメニューはテキスト送信前提）=====
 def parse_text_command(text: str) -> Optional[dict]:
     """
-    例：
-      うまなり 全 京都
+    リッチメニュー推奨：
+      うまなり 全 京都 今日
+      うまなり 全 京都 明日
+      うまなり 激熱 今日
+      うまなり 激熱 明日
+
+    互換：
       うまなり 全 京都 2026-02-08
       うまなり 京都11
       うまなり 東京5 爆走
@@ -376,19 +485,24 @@ def parse_text_command(text: str) -> Optional[dict]:
     if not text.startswith("うまなり"):
         return None
 
-    args = re.sub(r"^うまなり\s*", "", text).strip()
+    args = normalize_line(re.sub(r"^うまなり\s*", "", text))
     if not args:
         return {"mode": "help"}
 
-    # 全レース（リッチメニュー向け）
-    m_all = re.match(r"^全\s*(京都|東京|中山|阪神|小倉|福島|新潟)(?:\s+(\d{4}-\d{2}-\d{2}))?$", args)
-    if m_all:
-        return {"mode": "all", "track": m_all.group(1), "date": m_all.group(2)}
+    # 激熱： "激熱 今日/明日/YYYY-MM-DD"
+    m_hot = re.match(r"^激熱\s*(今日|明日|\d{4}-\d{2}-\d{2})$", args)
+    if m_hot:
+        day = m_hot.group(1)
+        date_ymd = resolve_day_token(day) or (day if is_ymd(day) else None)
+        return {"mode": "gekiatsu", "date": date_ymd, "day_token": day}
 
-    # 旧：全レース（互換）
-    m_all2 = re.match(r"^(京都|東京|中山|阪神|小倉|福島|新潟)\s+(\d{4}-\d{2}-\d{2})(\s+全)?$", args)
-    if m_all2:
-        return {"mode": "all", "track": m_all2.group(1), "date": m_all2.group(2)}
+    # 全レース： "全 京都 今日/明日/YYYY-MM-DD"
+    m_all = re.match(r"^全\s*(京都|東京|中山|阪神|小倉|福島|新潟)\s*(今日|明日|\d{4}-\d{2}-\d{2})?$", args)
+    if m_all:
+        track = m_all.group(1)
+        day = m_all.group(2)
+        date_ymd = resolve_day_token(day) if day in ("今日", "明日") else (day if (day and is_ymd(day)) else None)
+        return {"mode": "all", "track": track, "date": date_ymd, "day_token": day}
 
     # 単一R
     m_one = re.match(r"^(京都|東京|中山|阪神|小倉|福島|新潟)\s*(\d{1,2})\s*(勝率|爆走)?$", args)
@@ -443,10 +557,34 @@ async def webhook(req: Request):
         if cmd["mode"] == "help":
             line_reply(
                 reply_token,
-                "使い方：\n"
-                "・全R：うまなり 全 京都  /  うまなり 全 京都 2026-02-08\n"
-                "・単R：うまなり 京都11  /  うまなり 東京5 爆走"
+                "リッチメニュー用（おすすめ）：\n"
+                "・うまなり 全 京都 今日\n"
+                "・うまなり 全 京都 明日\n"
+                "・うまなり 激熱 今日\n"
+                "・うまなり 激熱 明日\n\n"
+                "手動：\n"
+                "・うまなり 全 京都 2026-02-08\n"
+                "・うまなり 京都11 / うまなり 東京5 爆走"
             )
+            continue
+
+        # 激熱
+        if cmd["mode"] == "gekiatsu":
+            date_ymd = cmd.get("date")
+            if not date_ymd:
+                line_reply(reply_token, "日付が解釈できませんでした。今日/明日/YYYY-MM-DD を使ってください。")
+                continue
+            try:
+                text = format_gekiatsu_text(date_ymd)
+                chunks = split_for_line(text)
+                line_reply_texts(reply_token, chunks[:5])
+            except Exception as e:
+                print("===== Gekiatsu ERROR START =====")
+                print("date:", date_ymd)
+                print("error:", repr(e))
+                traceback.print_exc()
+                print("===== Gekiatsu ERROR END =====")
+                line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
             continue
 
         # 全R
@@ -471,7 +609,7 @@ async def webhook(req: Request):
                 line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
             continue
 
-        # 単R
+        # 単R（直近記事＝date未指定）
         if cmd["mode"] == "race":
             track = cmd["track"]
             race_no = cmd["race"]
@@ -486,7 +624,8 @@ async def webhook(req: Request):
                     continue
 
                 header = [f"{track}{race_no}R（出典）", article_url, ""]
-                table = format_race_table(rows, mode=pick if pick in ("勝率", "爆走") else "両方")
+                mode = pick if pick in ("勝率", "爆走") else "両方"
+                table = format_race_table(rows, mode=mode)
                 line_reply(reply_token, "\n".join(header) + table)
 
             except Exception as e:
