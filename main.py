@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Optional, Set
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks
 
 APP = FastAPI()
 
@@ -27,13 +27,13 @@ HEADERS = {
 }
 
 MARKS = {"◎", "○", "▲", "△", "●"}
-TRACKS = ["京都", "東京", "中山", "阪神", "小倉", "福島", "新潟"]
+TRACKS = ["東京", "京都", "小倉", "中山", "阪神", "福島", "新潟"]  # 優先順（あなたのメニューに合わせ先頭3つ）
 
 JST = timezone(timedelta(hours=9))
 
-# ===== Cache（汎用）=====
+# ===== Cache =====
 CACHE_TTL = 5 * 60  # seconds
-_cache: Dict[str, Tuple[float, dict]] = {}  # key -> (timestamp, data)
+_cache: Dict[str, Tuple[float, dict]] = {}
 
 
 def cache_get(key: str, ttl: int = CACHE_TTL) -> Optional[dict]:
@@ -51,14 +51,14 @@ def cache_set(key: str, data: dict) -> None:
     _cache[key] = (time.time(), data)
 
 
-# ===== LINE署名検証 =====
+# ===== LINE signature =====
 def verify_line_signature(raw_body: bytes, signature: str) -> bool:
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
 
-# ===== LINE返信（最大5メッセージ）=====
+# ===== LINE Reply / Push =====
 def line_reply_texts(reply_token: str, texts: List[str]) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
@@ -75,16 +75,28 @@ def line_reply(reply_token: str, text: str) -> None:
     line_reply_texts(reply_token, [text])
 
 
-# ===== 正規化 =====
+def line_push_texts(user_id: str, texts: List[str]) -> None:
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    msgs = [{"type": "text", "text": t[:4800]} for t in texts[:5]]
+    payload = {"to": user_id, "messages": msgs}
+    r = requests.post(url, headers=headers, json=payload, timeout=25)
+    r.raise_for_status()
+
+
+# ===== normalize =====
 def normalize_line(s: str) -> str:
-    s = s.replace("\xa0", " ")     # NBSP
-    s = s.replace("\u3000", " ")   # 全角スペース
-    s = s.replace("，", ",")       # 全角カンマ
-    s = re.sub(r"\s+", " ", s)     # 連続空白を1つに
+    s = s.replace("\xa0", " ")
+    s = s.replace("\u3000", " ")
+    s = s.replace("，", ",")
+    s = re.sub(r"\s+", " ", s)
     return s.strip()
 
 
-# ===== 今日/明日 → YYYY-MM-DD =====
+# ===== 今日/明日 =====
 def resolve_day_token(tok: Optional[str]) -> Optional[str]:
     if not tok:
         return None
@@ -110,23 +122,19 @@ def ymd_to_md(date_ymd: str) -> Optional[str]:
     return f"{mm}/{dd}"
 
 
-# ===== 解析表（予想）カテゴリから、指定日の開催場を自動検出 =====
+# ===== detect tracks for date =====
 def detect_tracks_for_date(date_ymd: str) -> List[str]:
-    """
-    カテゴリ一覧のリンクテキストに M/D と「<場> 解析表（予想）」があるものを拾う
-    """
     md = ymd_to_md(date_ymd)
     if not md:
         return []
 
     cache_key = f"tracks_for:{date_ymd}"
-    cached = cache_get(cache_key, ttl=10 * 60)  # 10分キャッシュ
+    cached = cache_get(cache_key, ttl=10 * 60)
     if cached:
         return cached["tracks"]
 
     base = "https://www.umanari-ai.com/archives/cat_10152.html"
     pages = [base] + [f"{base}?p={i}" for i in range(2, 10)]
-
     found: Set[str] = set()
 
     for url in pages:
@@ -138,11 +146,13 @@ def detect_tracks_for_date(date_ymd: str) -> List[str]:
             t = normalize_line(a.get_text() or "")
             if md not in t:
                 continue
+            if "解析表（予想）" not in t:
+                continue
             for tr in TRACKS:
-                if (tr in t) and ("解析表（予想）" in t):
+                if tr in t:
                     found.add(tr)
 
-        # ある程度見つかったら早期終了
+        # だいたい3場見つかれば十分
         if len(found) >= 3:
             break
 
@@ -151,7 +161,7 @@ def detect_tracks_for_date(date_ymd: str) -> List[str]:
     return tracks
 
 
-# ===== 解析表（予想）記事URL取得（カテゴリ一覧から）=====
+# ===== find analysis url =====
 def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
     md = ymd_to_md(date_ymd) if date_ymd else None
     base = "https://www.umanari-ai.com/archives/cat_10152.html"
@@ -193,7 +203,7 @@ def extract_marks_from_text(s: str) -> List[str]:
     return [ch for ch in s if ch in MARKS]
 
 
-# ===== 記事本文パース（馬番・馬名・印が分割されても復元）=====
+# ===== parse article (reconstruct) =====
 def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]]:
     r = requests.get(article_url, headers=HEADERS, timeout=25)
     r.raise_for_status()
@@ -325,7 +335,7 @@ def get_umanari(track: str, date_ymd: Optional[str] = None) -> dict:
     return data
 
 
-# ===== 表整形 =====
+# ===== table formatting =====
 def pad2(n: int) -> str:
     return str(n).zfill(2)
 
@@ -349,7 +359,6 @@ def format_race_table(rows: List[dict], mode: str = "両方") -> str:
         if len(name) > name_w:
             name = name[: name_w - 1] + "…"
         name = name.ljust(14)
-
         win = (r.get("win") or "–")
         bak = (r.get("bakusou") or "–")
 
@@ -399,19 +408,8 @@ def split_for_line(text: str, max_len: int = 4400) -> List[str]:
     return parts
 
 
-# ===== 激熱抽出（勝率◎ and 爆走◎ が同一馬に付くレース）=====
+# ===== Gekiatsu =====
 def find_gekiatsu(date_ymd: str) -> dict:
-    """
-    return: {
-      "date": date_ymd,
-      "tracks": [
-        {"track": "京都", "article_url": "...", "races": [
-            {"race_no": 11, "horses":[{"no":2,"name":"..."}]}
-        ]},
-        ...
-      ]
-    }
-    """
     cache_key = f"gekiatsu:{date_ymd}"
     cached = cache_get(cache_key, ttl=5 * 60)
     if cached:
@@ -449,7 +447,6 @@ def find_gekiatsu(date_ymd: str) -> dict:
 def format_gekiatsu_text(date_ymd: str) -> str:
     g = find_gekiatsu(date_ymd)
     tracks = g["tracks"]
-
     out = [f"激熱レース（勝率◎×爆走◎） {date_ymd}", ""]
 
     if not tracks:
@@ -467,19 +464,14 @@ def format_gekiatsu_text(date_ymd: str) -> str:
     return "\n".join(out).strip()
 
 
-# ===== コマンド解析（リッチメニューはテキスト送信前提）=====
+# ===== command parser =====
 def parse_text_command(text: str) -> Optional[dict]:
     """
-    リッチメニュー推奨：
-      うまなり 全 京都 今日
+    リッチメニュー（テキスト送信）例：
+      うまなり 全 東京 今日
       うまなり 全 京都 明日
       うまなり 激熱 今日
       うまなり 激熱 明日
-
-    互換：
-      うまなり 全 京都 2026-02-08
-      うまなり 京都11
-      うまなり 東京5 爆走
     """
     text = text.strip()
     if not text.startswith("うまなり"):
@@ -489,23 +481,20 @@ def parse_text_command(text: str) -> Optional[dict]:
     if not args:
         return {"mode": "help"}
 
-    # 激熱： "激熱 今日/明日/YYYY-MM-DD"
     m_hot = re.match(r"^激熱\s*(今日|明日|\d{4}-\d{2}-\d{2})$", args)
     if m_hot:
         day = m_hot.group(1)
         date_ymd = resolve_day_token(day) or (day if is_ymd(day) else None)
         return {"mode": "gekiatsu", "date": date_ymd, "day_token": day}
 
-    # 全レース： "全 京都 今日/明日/YYYY-MM-DD"
-    m_all = re.match(r"^全\s*(京都|東京|中山|阪神|小倉|福島|新潟)\s*(今日|明日|\d{4}-\d{2}-\d{2})?$", args)
+    m_all = re.match(r"^全\s*(東京|京都|小倉|中山|阪神|福島|新潟)\s*(今日|明日|\d{4}-\d{2}-\d{2})?$", args)
     if m_all:
         track = m_all.group(1)
         day = m_all.group(2)
         date_ymd = resolve_day_token(day) if day in ("今日", "明日") else (day if (day and is_ymd(day)) else None)
         return {"mode": "all", "track": track, "date": date_ymd, "day_token": day}
 
-    # 単一R
-    m_one = re.match(r"^(京都|東京|中山|阪神|小倉|福島|新潟)\s*(\d{1,2})\s*(勝率|爆走)?$", args)
+    m_one = re.match(r"^(東京|京都|小倉|中山|阪神|福島|新潟)\s*(\d{1,2})\s*(勝率|爆走)?$", args)
     if m_one:
         return {
             "mode": "race",
@@ -525,7 +514,7 @@ def health():
 
 @APP.post("/webhook")
 @APP.post("/webhook/")
-async def webhook(req: Request):
+async def webhook(req: Request, background_tasks: BackgroundTasks):
     if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
         raise HTTPException(status_code=500, detail="Env vars not set")
 
@@ -550,66 +539,107 @@ async def webhook(req: Request):
         if not reply_token:
             continue
 
+        # 受信ログ（切り分け用）
+        try:
+            print("IN:", (ev.get("source") or {}), "TEXT:", text_in)
+        except Exception:
+            pass
+
         cmd = parse_text_command(text_in)
         if not cmd:
             continue
 
+        source = ev.get("source") or {}
+        user_id = source.get("userId")  # 1:1なら取れる
+
         if cmd["mode"] == "help":
             line_reply(
                 reply_token,
-                "リッチメニュー用（おすすめ）：\n"
-                "・うまなり 全 京都 今日\n"
-                "・うまなり 全 京都 明日\n"
-                "・うまなり 激熱 今日\n"
-                "・うまなり 激熱 明日\n\n"
-                "手動：\n"
-                "・うまなり 全 京都 2026-02-08\n"
-                "・うまなり 京都11 / うまなり 東京5 爆走"
+                "リッチメニュー用：\n"
+                "・うまなり 全 東京 今日 / 明日\n"
+                "・うまなり 全 京都 今日 / 明日\n"
+                "・うまなり 全 小倉 今日 / 明日\n"
+                "・うまなり 激熱 今日 / 明日\n\n"
+                "単R：うまなり 京都11 / うまなり 東京5 爆走"
             )
             continue
 
-        # 激熱
+        # ===== 激熱（重い→即レス→push）=====
         if cmd["mode"] == "gekiatsu":
             date_ymd = cmd.get("date")
             if not date_ymd:
-                line_reply(reply_token, "日付が解釈できませんでした。今日/明日/YYYY-MM-DD を使ってください。")
+                line_reply(reply_token, "日付が解釈できませんでした。今日/明日を使ってください。")
                 continue
-            try:
-                text = format_gekiatsu_text(date_ymd)
-                chunks = split_for_line(text)
-                line_reply_texts(reply_token, chunks[:5])
-            except Exception as e:
-                print("===== Gekiatsu ERROR START =====")
-                print("date:", date_ymd)
-                print("error:", repr(e))
-                traceback.print_exc()
-                print("===== Gekiatsu ERROR END =====")
-                line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
+
+            if not user_id:
+                # userId取れない場合は一応replyで頑張る（失効する可能性あり）
+                try:
+                    text = format_gekiatsu_text(date_ymd)
+                    chunks = split_for_line(text)
+                    line_reply_texts(reply_token, chunks[:5])
+                except Exception:
+                    traceback.print_exc()
+                    line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
+                continue
+
+            # ★即レス
+            line_reply(reply_token, f"取得中…（激熱 {date_ymd}）")
+
+            # ★裏処理→push
+            def job_hot():
+                try:
+                    text = format_gekiatsu_text(date_ymd)
+                    chunks = split_for_line(text)
+                    line_push_texts(user_id, chunks[:5])
+                except Exception:
+                    traceback.print_exc()
+                    try:
+                        line_push_texts(user_id, ["取得に失敗しました。Render Logs を確認してください。"])
+                    except Exception:
+                        pass
+
+            background_tasks.add_task(job_hot)
             continue
 
-        # 全R
+        # ===== 全R（重い→即レス→push）=====
         if cmd["mode"] == "all":
             track = cmd["track"]
             date_ymd = cmd.get("date")
-            try:
-                d = get_umanari(track, date_ymd=date_ymd)
-                article_url = d["article_url"]
-                races = d["races"]
 
-                text = build_all_races_text(track, date_ymd, article_url, races)
-                chunks = split_for_line(text)
-                line_reply_texts(reply_token, chunks[:5])
+            if not user_id:
+                # userId取れない場合はreplyで（失効の可能性あり）
+                try:
+                    d = get_umanari(track, date_ymd=date_ymd)
+                    text = build_all_races_text(track, date_ymd, d["article_url"], d["races"])
+                    chunks = split_for_line(text)
+                    line_reply_texts(reply_token, chunks[:5])
+                except Exception:
+                    traceback.print_exc()
+                    line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
+                continue
 
-            except Exception as e:
-                print("===== UMANARI ALL ERROR START =====")
-                print("track:", track, "date:", date_ymd)
-                print("error:", repr(e))
-                traceback.print_exc()
-                print("===== UMANARI ALL ERROR END =====")
-                line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
+            # ★即レス
+            label_day = cmd.get("day_token") or (date_ymd or "最新")
+            line_reply(reply_token, f"取得中…（{track} 全R {label_day}）")
+
+            # ★裏処理→push
+            def job_all():
+                try:
+                    d = get_umanari(track, date_ymd=date_ymd)
+                    text = build_all_races_text(track, date_ymd, d["article_url"], d["races"])
+                    chunks = split_for_line(text)
+                    line_push_texts(user_id, chunks[:5])
+                except Exception:
+                    traceback.print_exc()
+                    try:
+                        line_push_texts(user_id, ["取得に失敗しました。Render Logs を確認してください。"])
+                    except Exception:
+                        pass
+
+            background_tasks.add_task(job_all)
             continue
 
-        # 単R（直近記事＝date未指定）
+        # ===== 単R（軽いのでreplyのまま）=====
         if cmd["mode"] == "race":
             track = cmd["track"]
             race_no = cmd["race"]
@@ -623,17 +653,13 @@ async def webhook(req: Request):
                     line_reply(reply_token, f"{track}{race_no}Rのデータが見つかりません。\n出典: {article_url}")
                     continue
 
-                header = [f"{track}{race_no}R（出典）", article_url, ""]
                 mode = pick if pick in ("勝率", "爆走") else "両方"
+                header = [f"{track}{race_no}R（出典）", article_url, ""]
                 table = format_race_table(rows, mode=mode)
                 line_reply(reply_token, "\n".join(header) + table)
 
-            except Exception as e:
-                print("===== UMANARI RACE ERROR START =====")
-                print("track:", track, "race:", race_no, "pick:", pick)
-                print("error:", repr(e))
+            except Exception:
                 traceback.print_exc()
-                print("===== UMANARI RACE ERROR END =====")
                 line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
             continue
 
