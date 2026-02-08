@@ -98,53 +98,12 @@ def find_analysis_url(track: str) -> str:
     raise RuntimeError(f"解析表（予想）のURLが見つかりません: {track}")
 
 
-# ---- horse row parser (スペースなしでも対応) ----
-def parse_horse_row(line: str) -> Optional[dict]:
-    """
-    OK例:
-      "02 エムズビギン ◎ ●"
-      "02エムズビギン◎●"
-      "2エムズビギン◎"
-      "02, エムズビギン ◎  ●"
-    """
-    s = normalize_line(line)
-    if not s:
-        return None
-
-    # 先頭が馬番（1-2桁）で始まるものだけ
-    m = re.match(r"^(\d{1,2})\s*,?\s*(.*)$", s)
-    if not m:
-        return None
-
-    try:
-        no = int(m.group(1))
-    except ValueError:
-        return None
-
-    rest = m.group(2).strip()
-    if not rest:
-        return None
-
-    # 末尾から印を最大2つはがす（スペースの有無に関係なく）
-    marks = []
-    while rest and rest[-1] in MARKS and len(marks) < 2:
-        marks.append(rest[-1])
-        rest = rest[:-1].rstrip()
-
-    marks = list(reversed(marks))
-    win = marks[0] if len(marks) >= 1 else ""
-    bak = marks[1] if len(marks) >= 2 else ""
-
-    # 馬名の末尾に残った区切り記号などを軽く除去
-    name = rest.strip()
-    name = re.sub(r"[|/]+$", "", name).strip()
-    if not name:
-        return None
-
-    return {"no": no, "name": name, "win": win, "bakusou": bak}
+def extract_marks_from_text(s: str) -> List[str]:
+    """文字列中に含まれる印を左→右の順で返す（最大2個を使う）"""
+    found = [ch for ch in s if ch in MARKS]
+    return found
 
 
-# ---- parse article ----
 def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]]:
     r = requests.get(article_url, headers=HEADERS, timeout=25)
     r.raise_for_status()
@@ -164,17 +123,47 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
     lines = [normalize_line(x) for x in raw_text.splitlines()]
     lines = [x for x in lines if x]
 
+    # セクション: "京都 11R ..." / "京都11R ..."
     sec_re = re.compile(rf"^{re.escape(track)}\s*(\d{{1,2}})\s*R\b")
 
     races: Dict[int, List[dict]] = {}
     current_r: Optional[int] = None
 
-    # 11Rデバッグ用：数字で始まる行を数個だけ出す
-    debug_lines_11 = []
+    # 状態（分割行を復元）
+    pending_no: Optional[int] = None
+    pending_name_parts: List[str] = []
+    pending_marks: List[str] = []
+
+    def flush_pending():
+        nonlocal pending_no, pending_name_parts, pending_marks
+        if pending_no is None:
+            return
+        name = normalize_line(" ".join(pending_name_parts))
+        # nameが空なら捨てる
+        if not name:
+            pending_no = None
+            pending_name_parts = []
+            pending_marks = []
+            return
+
+        win = pending_marks[0] if len(pending_marks) >= 1 else ""
+        bak = pending_marks[1] if len(pending_marks) >= 2 else ""
+        races[current_r].append({"no": pending_no, "name": name, "win": win, "bakusou": bak})
+
+        pending_no = None
+        pending_name_parts = []
+        pending_marks = []
+
+    # デバッグ：11Rで「馬番だけ行」の並びが見えるようにする
+    debug_11_samples: List[str] = []
 
     for line in lines:
         sm = sec_re.match(line)
         if sm:
+            # セクションが切り替わる前に未確定を確定
+            if current_r is not None:
+                flush_pending()
+
             current_r = int(sm.group(1))
             races.setdefault(current_r, [])
             continue
@@ -183,26 +172,78 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
             continue
 
         if "データ不足の為解析不可" in line:
+            # このRは破棄
             races.pop(current_r, None)
             current_r = None
+            pending_no = None
+            pending_name_parts = []
+            pending_marks = []
             continue
 
         if line == "馬名 勝率 爆走":
             continue
 
-        # デバッグ収集：11R中の「数字で始まる行」を拾う（最大15行）
-        if current_r == 11 and re.match(r"^\d{1,2}", line) and len(debug_lines_11) < 15:
-            debug_lines_11.append(line)
+        # ---- ここから「分割された馬データ」を復元 ----
 
-        row = parse_horse_row(line)
-        if row:
-            races[current_r].append(row)
+        # 馬番だけの行（"01" "2" など）
+        if re.fullmatch(r"\d{1,2}", line):
+            if current_r == 11 and len(debug_11_samples) < 15:
+                debug_11_samples.append(line)
 
-    # rowsが空の時に何が来てるか確認できるようにログ出し
+            # 次の馬番が来た＝前の馬を確定してから新規開始
+            flush_pending()
+            pending_no = int(line)
+            continue
+
+        # 馬番＋何か（"01 カシノ..." / "01,カシノ..." みたいなケースも拾う）
+        m = re.match(r"^(\d{1,2})\s*,?\s*(.+)$", line)
+        if m:
+            flush_pending()
+            pending_no = int(m.group(1))
+            rest = m.group(2).strip()
+            # 同じ行に印も入ってたら取る
+            ms = extract_marks_from_text(rest)
+            if ms:
+                pending_marks.extend(ms[: 2 - len(pending_marks)])
+                # 印を除去した残りを馬名候補へ
+                rest2 = "".join(ch for ch in rest if ch not in MARKS).strip()
+                if rest2:
+                    pending_name_parts.append(rest2)
+            else:
+                pending_name_parts.append(rest)
+            continue
+
+        # ここに来るのは「馬番の次の行」＝馬名 or 印だけ or 続き
+        if pending_no is not None:
+            ms = extract_marks_from_text(line)
+
+            # 印だけの行（例："◎" や "◎ ●"）
+            if ms and normalize_line("".join(ch for ch in line if ch in MARKS)) == normalize_line(line.replace(" ", "")):
+                pending_marks.extend(ms[: 2 - len(pending_marks)])
+                continue
+
+            # 印が混ざっている行（馬名 + 印）もあるので分離
+            if ms:
+                pending_marks.extend(ms[: 2 - len(pending_marks)])
+                name_part = "".join(ch for ch in line if ch not in MARKS).strip()
+                if name_part:
+                    pending_name_parts.append(name_part)
+                continue
+
+            # ただの馬名（または馬名の続き）
+            pending_name_parts.append(line)
+            continue
+
+        # pending_no が無いのにここに来た行は無視
+        continue
+
+    # 最後の馬を確定
+    if current_r is not None:
+        flush_pending()
+
+    # まだ11Rが空なら、ログに「馬番だけ行」サンプルを出す
     if 11 in races and len(races.get(11, [])) == 0:
-        print("PARSE DEBUG: 11R has section but 0 horses. Sample digit-start lines:")
-        for i, dl in enumerate(debug_lines_11):
-            print(f"  [11R#{i}] {repr(dl)}")
+        print("PARSE DEBUG: 11R has section but 0 horses. Sample number-only lines:", debug_11_samples)
 
     return races
 
@@ -229,7 +270,6 @@ def format_reply(track: str, race_no: int, mode: str, article_url: str, rows: Li
 
     if not rows:
         out.append("該当データが見つかりませんでした（解析不可 or パースできず）。")
-        out.append("※Render Logs に 11Rのサンプル行が出るので貼ってください。")
         return "\n".join(out)
 
     for r in rows:
