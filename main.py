@@ -53,7 +53,7 @@ def verify_line_signature(raw_body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-# ---- LINE reply (Messaging API) ----
+# ---- LINE reply ----
 def line_reply(reply_token: str, text: str) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
@@ -68,18 +68,16 @@ def line_reply(reply_token: str, text: str) -> None:
     r.raise_for_status()
 
 
-# ---- normalize: NBSP/全角スペース/連続空白/カンマ揺れを整形 ----
+# ---- normalize ----
 def normalize_line(s: str) -> str:
-    s = s.replace("\xa0", " ")   # NBSP
-    s = s.replace("\u3000", " ") # 全角スペース
-    s = s.replace("，", ",")     # 全角カンマ
-    s = s.replace("．", ".")     # 全角ピリオド
-    # Unicode空白全般を1つに
-    s = re.sub(r"\s+", " ", s)
+    s = s.replace("\xa0", " ")     # NBSP
+    s = s.replace("\u3000", " ")   # 全角スペース
+    s = s.replace("，", ",")       # 全角カンマ
+    s = re.sub(r"\s+", " ", s)     # 連続空白を1つに
     return s.strip()
 
 
-# ---- find analysis article url (category list is stable) ----
+# ---- find analysis url (category list) ----
 def find_analysis_url(track: str) -> str:
     cat_url = "https://www.umanari-ai.com/archives/cat_10152.html"
     r = requests.get(cat_url, headers=HEADERS, timeout=25)
@@ -100,51 +98,48 @@ def find_analysis_url(track: str) -> str:
     raise RuntimeError(f"解析表（予想）のURLが見つかりません: {track}")
 
 
-# ---- robust horse row parser (regexを捨てる) ----
+# ---- horse row parser (スペースなしでも対応) ----
 def parse_horse_row(line: str) -> Optional[dict]:
     """
-    line例:
+    OK例:
       "02 エムズビギン ◎ ●"
-      "01 ゾロアストロ"
-      "08 ショウナンガルフ △ ◎"
-    揺れ:
+      "02エムズビギン◎●"
+      "2エムズビギン◎"
       "02, エムズビギン ◎  ●"
     """
     s = normalize_line(line)
     if not s:
         return None
 
-    # 先頭が数字で始まらないなら馬行ではない
-    if not re.match(r"^\d{1,2}\b", s):
+    # 先頭が馬番（1-2桁）で始まるものだけ
+    m = re.match(r"^(\d{1,2})\s*,?\s*(.*)$", s)
+    if not m:
         return None
 
-    # "02," みたいなカンマを除去
-    s = re.sub(r"^(\d{1,2})\s*,\s*", r"\1 ", s)
-
-    parts = s.split(" ")
-    if len(parts) < 2:
-        return None
-
-    # 馬番
     try:
-        no = int(parts[0])
+        no = int(m.group(1))
     except ValueError:
         return None
 
-    # 末尾から印を最大2つ取り出す（勝率・爆走）
-    marks = []
-    while parts and parts[-1] in MARKS and len(marks) < 2:
-        marks.append(parts.pop())
-    marks = list(reversed(marks))  # 元の順に戻す
-
-    # 残りが馬名（馬番を除いた部分）
-    name_parts = parts[1:]
-    if not name_parts:
+    rest = m.group(2).strip()
+    if not rest:
         return None
-    name = " ".join(name_parts).strip()
 
+    # 末尾から印を最大2つはがす（スペースの有無に関係なく）
+    marks = []
+    while rest and rest[-1] in MARKS and len(marks) < 2:
+        marks.append(rest[-1])
+        rest = rest[:-1].rstrip()
+
+    marks = list(reversed(marks))
     win = marks[0] if len(marks) >= 1 else ""
     bak = marks[1] if len(marks) >= 2 else ""
+
+    # 馬名の末尾に残った区切り記号などを軽く除去
+    name = rest.strip()
+    name = re.sub(r"[|/]+$", "", name).strip()
+    if not name:
+        return None
 
     return {"no": no, "name": name, "win": win, "bakusou": bak}
 
@@ -155,7 +150,7 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # 本文っぽい領域を優先
+    # 本文候補を優先
     node = (
         soup.select_one(".article-body")
         or soup.select_one(".articleBody")
@@ -169,16 +164,18 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
     lines = [normalize_line(x) for x in raw_text.splitlines()]
     lines = [x for x in lines if x]
 
-    # セクション: "京都 11R ..." / "京都11R ..." の揺れ対応
     sec_re = re.compile(rf"^{re.escape(track)}\s*(\d{{1,2}})\s*R\b")
 
     races: Dict[int, List[dict]] = {}
     current_r: Optional[int] = None
 
+    # 11Rデバッグ用：数字で始まる行を数個だけ出す
+    debug_lines_11 = []
+
     for line in lines:
-        m = sec_re.match(line)
-        if m:
-            current_r = int(m.group(1))
+        sm = sec_re.match(line)
+        if sm:
+            current_r = int(sm.group(1))
             races.setdefault(current_r, [])
             continue
 
@@ -193,9 +190,19 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
         if line == "馬名 勝率 爆走":
             continue
 
+        # デバッグ収集：11R中の「数字で始まる行」を拾う（最大15行）
+        if current_r == 11 and re.match(r"^\d{1,2}", line) and len(debug_lines_11) < 15:
+            debug_lines_11.append(line)
+
         row = parse_horse_row(line)
         if row:
             races[current_r].append(row)
+
+    # rowsが空の時に何が来てるか確認できるようにログ出し
+    if 11 in races and len(races.get(11, [])) == 0:
+        print("PARSE DEBUG: 11R has section but 0 horses. Sample digit-start lines:")
+        for i, dl in enumerate(debug_lines_11):
+            print(f"  [11R#{i}] {repr(dl)}")
 
     return races
 
@@ -222,6 +229,7 @@ def format_reply(track: str, race_no: int, mode: str, article_url: str, rows: Li
 
     if not rows:
         out.append("該当データが見つかりませんでした（解析不可 or パースできず）。")
+        out.append("※Render Logs に 11Rのサンプル行が出るので貼ってください。")
         return "\n".join(out)
 
     for r in rows:
@@ -242,7 +250,6 @@ def health():
     return {"ok": True}
 
 
-# 307対策：/webhook と /webhook/ 両対応
 @APP.post("/webhook")
 @APP.post("/webhook/")
 async def webhook(req: Request):
