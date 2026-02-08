@@ -4,6 +4,7 @@ import time
 import hmac
 import hashlib
 import base64
+import traceback
 from typing import Dict, List, Tuple, Optional
 
 import requests
@@ -12,19 +13,23 @@ from fastapi import FastAPI, Request, Response, HTTPException
 
 APP = FastAPI()
 
+# ===== Render の Environment Variables に入れる =====
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 PORT = int(os.environ.get("PORT", "10000"))
 
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    # Render上で環境変数が未設定だと起動時に分かるように
-    print("Missing env vars: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
-
 UA = "UmanariLineBot/1.0 (+contact)"
+
+HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.8,en;q=0.7",
+    "Connection": "close",
+}
 
 MARKS = {"◎", "○", "▲", "△", "●"}
 
-# ---- 簡易キャッシュ（負荷軽減） ----
+# ===== 簡易キャッシュ（同じ場は5分は再取得しない）=====
 CACHE_TTL = 5 * 60  # seconds
 _cache: Dict[str, Tuple[float, dict]] = {}  # key -> (timestamp, data)
 
@@ -44,14 +49,14 @@ def cache_set(key: str, data: dict) -> None:
     _cache[key] = (time.time(), data)
 
 
-# ---- LINE署名検証 ----
+# ===== LINE署名検証 =====
 def verify_line_signature(raw_body: bytes, signature: str) -> bool:
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
 
-# ---- LINE返信（Messaging API） ----
+# ===== LINE返信（Messaging API直叩き）=====
 def line_reply(reply_token: str, text: str) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
@@ -62,17 +67,21 @@ def line_reply(reply_token: str, text: str) -> None:
         "replyToken": reply_token,
         "messages": [{"type": "text", "text": text[:4800]}],  # 念のため長文カット
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=10)
+    r = requests.post(url, headers=headers, json=payload, timeout=15)
     r.raise_for_status()
 
 
-# ---- うまなりAI：トップから「解析表（予想）」URLを探す ----
+# ===== うまなりAI：解析表（予想）カテゴリ一覧から当日っぽい記事URLを拾う =====
 def find_analysis_url(track: str) -> str:
-    top = "https://www.umanari-ai.com/"
-    html = requests.get(top, headers={"User-Agent": UA}, timeout=10).text
-    soup = BeautifulSoup(html, "html.parser")
+    # 解析表（予想）のカテゴリ一覧（トップより安定）
+    cat_url = "https://www.umanari-ai.com/archives/cat_10152.html"
+    r = requests.get(cat_url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
 
     key = f"{track} 解析表（予想）"
+
+    # まずはリンクテキストで探す（最優先）
     for a in soup.select("a"):
         t = (a.get_text() or "").strip()
         if key in t:
@@ -81,21 +90,49 @@ def find_analysis_url(track: str) -> str:
                 continue
             if href.startswith("http"):
                 return href
-            return requests.compat.urljoin(top, href)
+            return requests.compat.urljoin(cat_url, href)
+
+    # 見つからない場合は、href自体に "archives/" が含まれるものを広めに拾って二次判定
+    candidates = []
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        t = (a.get_text() or "").strip()
+        if "umanari-ai.com/archives/" in href or href.startswith("/archives/"):
+            if track in t and "解析表（予想）" in t:
+                candidates.append((t, href))
+
+    if candidates:
+        _, href = candidates[0]
+        if href.startswith("http"):
+            return href
+        return requests.compat.urljoin(cat_url, href)
 
     raise RuntimeError(f"解析表（予想）のURLが見つかりません: {track}")
 
 
-# ---- うまなりAI：記事本文をパースして Rごとの一覧を作る ----
+# ===== うまなりAI：記事本文をパースして Rごとの一覧を作る =====
 def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]]:
-    html = requests.get(article_url, headers={"User-Agent": UA}, timeout=10).text
-    soup = BeautifulSoup(html, "html.parser")
+    r = requests.get(article_url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    # livedoorブログは本文がテキストとして取れることが多い
-    text = soup.get_text("\n")
+    # 本文だけに寄せる（body全文よりノイズが減る）
+    # livedoorブログは articleBody / entry-body 等のことがあるので複数候補
+    node = (
+        soup.select_one(".article-body")
+        or soup.select_one(".articleBody")
+        or soup.select_one(".entry-body")
+        or soup.select_one("#article-body")
+        or soup.body
+    )
+
+    text = node.get_text("\n") if node else soup.get_text("\n")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
+    # セクション例: "京都 11R きさらぎ賞" / "京都 1R"
     sec_re = re.compile(rf"^{re.escape(track)}\s+(\d{{1,2}})R\b")
+
+    # 行例: "02 エムズビギン ◎ ●" / 印が片方だけの場合もある
     row_re = re.compile(r"^(\d{2})\s+(.+?)\s*(◎|○|▲|△|●)?\s*(◎|○|▲|△|●)?\s*$")
 
     races: Dict[int, List[dict]] = {}
@@ -111,11 +148,13 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
         if current_r is None:
             continue
 
+        # 解析不可のRは落とす
         if "データ不足の為解析不可" in line:
             races.pop(current_r, None)
             current_r = None
             continue
 
+        # ヘッダ行はスキップ
         if line == "馬名 勝率 爆走":
             continue
 
@@ -123,8 +162,14 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
         if rm:
             no = int(rm.group(1))
             name = rm.group(2).strip()
-            win = rm.group(3) if rm.group(3) in MARKS else ""
-            bak = rm.group(4) if rm.group(4) in MARKS else ""
+
+            # 印の出方は揺れるので、取れたものを勝率→爆走の順に入れる（片方だけでもOK）
+            m1 = rm.group(3) if rm.group(3) in MARKS else ""
+            m2 = rm.group(4) if rm.group(4) in MARKS else ""
+
+            win = m1
+            bak = m2
+
             races[current_r].append({"no": no, "name": name, "win": win, "bakusou": bak})
 
     return races
@@ -155,12 +200,13 @@ def format_reply(track: str, race_no: int, mode: str, article_url: str, rows: Li
     out.append("")
 
     if not rows:
-        out.append("該当データが見つかりませんでした。")
+        out.append("該当データが見つかりませんでした（解析不可 or パースできず）。")
         return "\n".join(out)
 
     for r in rows:
-        win = r["win"] or "–"
-        bak = r["bakusou"] or "–"
+        win = r.get("win") or "–"
+        bak = r.get("bakusou") or "–"
+
         if mode == "勝率":
             out.append(f"{pad2(r['no'])} {r['name']}  勝率:{win}")
         elif mode == "爆走":
@@ -171,19 +217,21 @@ def format_reply(track: str, race_no: int, mode: str, article_url: str, rows: Li
     return "\n".join(out)
 
 
-# ---- FastAPI endpoints ----
+# ===== FastAPI endpoints =====
 @APP.get("/")
 def health():
     return {"ok": True}
 
 
+# 307対策：末尾スラッシュあり/なし両対応
 @APP.post("/webhook")
+@APP.post("/webhook/")
 async def webhook(req: Request):
-    raw = await req.body()
-    sig = req.headers.get("x-line-signature", "")
-
     if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
         raise HTTPException(status_code=500, detail="Env vars not set")
+
+    raw = await req.body()
+    sig = req.headers.get("x-line-signature", "")
 
     if not verify_line_signature(raw, sig):
         raise HTTPException(status_code=401, detail="Invalid signature")
@@ -194,16 +242,17 @@ async def webhook(req: Request):
     for ev in events:
         if ev.get("type") != "message":
             continue
+
         msg = ev.get("message", {})
         if msg.get("type") != "text":
             continue
 
         text = (msg.get("text") or "").strip()
         reply_token = ev.get("replyToken")
-
         if not reply_token:
             continue
 
+        # コマンド: うまなり 京都11 / うまなり 東京5 爆走 / うまなり 小倉9 勝率
         if not text.startswith("うまなり"):
             continue
 
@@ -227,7 +276,18 @@ async def webhook(req: Request):
             rows = data["races"].get(race_no, [])
             resp = format_reply(track, race_no, mode, article_url, rows)
             line_reply(reply_token, resp)
-        except Exception:
-            line_reply(reply_token, f"取得に失敗しました。少し時間をおいて再実行してください。（{track}{race_no}R）")
+
+        except Exception as e:
+            # ★原因は必ずRender Logsに出す
+            print("===== UMANARI ERROR START =====")
+            print("track:", track, "race:", race_no, "mode:", mode)
+            print("error:", repr(e))
+            traceback.print_exc()
+            print("===== UMANARI ERROR END =====")
+
+            line_reply(
+                reply_token,
+                f"取得に失敗しました。Render Logs に原因が出ています。（{track}{race_no}R）"
+            )
 
     return Response(content="OK", media_type="text/plain")
