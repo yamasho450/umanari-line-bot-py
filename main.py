@@ -141,7 +141,7 @@ def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
 
     if md:
         raise RuntimeError(f"指定日({date_ymd} / {md})の解析表URLが見つかりません: {track}")
-    raise RuntimeError(f"解析表（予想）のURLが見つかりません: {track}"
+    raise RuntimeError(f"解析表（予想）のURLが見つかりません: {track}")
 
 
 def extract_marks_from_text(s: str) -> List[str]:
