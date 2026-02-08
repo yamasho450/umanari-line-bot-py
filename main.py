@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request, Response, HTTPException
 
 APP = FastAPI()
 
+# ===== Render Environment Variables =====
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 
@@ -26,7 +27,7 @@ HEADERS = {
 
 MARKS = {"◎", "○", "▲", "△", "●"}
 
-# ---- cache ----
+# ===== Cache（場×日付で5分）=====
 CACHE_TTL = 5 * 60  # seconds
 _cache: Dict[str, Tuple[float, dict]] = {}  # key -> (timestamp, data)
 
@@ -46,26 +47,23 @@ def cache_set(key: str, data: dict) -> None:
     _cache[key] = (time.time(), data)
 
 
-# ---- LINE signature ----
+# ===== LINE署名検証 =====
 def verify_line_signature(raw_body: bytes, signature: str) -> bool:
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
 
-# ---- LINE reply (multiple messages, up to 5) ----
+# ===== LINE返信（最大5メッセージ）=====
 def line_reply_texts(reply_token: str, texts: List[str]) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-
-    # LINE reply は最大5メッセージ
     msgs = [{"type": "text", "text": t[:4800]} for t in texts[:5]]
     payload = {"replyToken": reply_token, "messages": msgs}
-
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
+    r = requests.post(url, headers=headers, json=payload, timeout=25)
     r.raise_for_status()
 
 
@@ -73,7 +71,7 @@ def line_reply(reply_token: str, text: str) -> None:
     line_reply_texts(reply_token, [text])
 
 
-# ---- normalize ----
+# ===== 正規化 =====
 def normalize_line(s: str) -> str:
     s = s.replace("\xa0", " ")     # NBSP
     s = s.replace("\u3000", " ")   # 全角スペース
@@ -82,11 +80,10 @@ def normalize_line(s: str) -> str:
     return s.strip()
 
 
-# ---- date helper ----
+# ===== 日付変換 =====
 def ymd_to_md(date_ymd: str) -> Optional[str]:
     """
     '2026-02-08' -> '2/8'
-    変換できなければ None
     """
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", date_ymd.strip())
     if not m:
@@ -96,17 +93,15 @@ def ymd_to_md(date_ymd: str) -> Optional[str]:
     return f"{mm}/{dd}"
 
 
-# ---- find analysis url (category list, with optional date) ----
+# ===== 解析表（予想）記事URL取得（カテゴリ一覧から）=====
 def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
     """
-    date_ymd がある場合：リンクテキストに「M/D」と「<場> 解析表（予想）」が両方入るものを探す
-    date_ymd がない場合：最新の「<場> 解析表（予想）」を取る
+    date_ymdあり：リンクテキストに「M/D」と「<場> 解析表（予想）」が両方入る記事
+    date_ymdなし：最新の「<場> 解析表（予想）」記事
     """
     md = ymd_to_md(date_ymd) if date_ymd else None
-
-    # 解析表（予想）のカテゴリ一覧。ページ送りがあるので数ページ見る
     base = "https://www.umanari-ai.com/archives/cat_10152.html"
-    pages = [base] + [f"{base}?p={i}" for i in range(2, 6)]  # 最大5ページ
+    pages = [base] + [f"{base}?p={i}" for i in range(2, 10)]  # 1〜9ページ検索（多少余裕）
 
     key = f"{track} 解析表（予想）"
 
@@ -115,7 +110,7 @@ def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # date指定がある場合は md も含めて探す（例：2/8）
+        # 指定日がある場合：mdも含めて一致
         if md:
             for a in soup.select("a"):
                 t = normalize_line(a.get_text() or "")
@@ -126,9 +121,8 @@ def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
                     if href.startswith("http"):
                         return href
                     return requests.compat.urljoin(cat_url, href)
-
-        # date指定がない場合：最初に見つかった最新を返す
         else:
+            # 指定日がない場合：最初に見つかった最新
             for a in soup.select("a"):
                 t = normalize_line(a.get_text() or "")
                 if key in t:
@@ -145,11 +139,10 @@ def find_analysis_url(track: str, date_ymd: Optional[str] = None) -> str:
 
 
 def extract_marks_from_text(s: str) -> List[str]:
-    found = [ch for ch in s if ch in MARKS]
-    return found
+    return [ch for ch in s if ch in MARKS]
 
 
-# ---- parse analysis article (復元パース) ----
+# ===== 記事本文パース（馬番・馬名・印が分割されても復元）=====
 def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]]:
     r = requests.get(article_url, headers=HEADERS, timeout=25)
     r.raise_for_status()
@@ -168,6 +161,7 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
     lines = [normalize_line(x) for x in raw_text.splitlines()]
     lines = [x for x in lines if x]
 
+    # "京都 11R" / "京都11R" 対応
     sec_re = re.compile(rf"^{re.escape(track)}\s*(\d{{1,2}})\s*R\b")
 
     races: Dict[int, List[dict]] = {}
@@ -184,7 +178,6 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
             pending_name_parts = []
             pending_marks = []
             return
-
         if pending_no is None:
             return
 
@@ -206,10 +199,8 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
     for line in lines:
         sm = sec_re.match(line)
         if sm:
-            # 次のRに移る前に確定
             if current_r is not None:
                 flush_pending()
-
             current_r = int(sm.group(1))
             races.setdefault(current_r, [])
             continue
@@ -228,18 +219,19 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
         if line == "馬名 勝率 爆走":
             continue
 
-        # 馬番だけ行
+        # 馬番だけの行
         if re.fullmatch(r"\d{1,2}", line):
             flush_pending()
             pending_no = int(line)
             continue
 
-        # 馬番+何か（同一行型）
+        # 馬番 + 何かの行
         m = re.match(r"^(\d{1,2})\s*,?\s*(.+)$", line)
         if m:
             flush_pending()
             pending_no = int(m.group(1))
             rest = m.group(2).strip()
+
             ms = extract_marks_from_text(rest)
             if ms:
                 pending_marks.extend(ms[: 2 - len(pending_marks)])
@@ -250,17 +242,15 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
                 pending_name_parts.append(rest)
             continue
 
-        # pending中：馬名 or 印だけ行
+        # pending中（馬名 or 印）
         if pending_no is not None:
             ms = extract_marks_from_text(line)
 
-            # 印だけっぽい行（記号だけ or 空白+記号）
             only_marks = normalize_line("".join(ch for ch in line if ch in MARKS))
             if ms and only_marks == normalize_line(line.replace(" ", "")):
                 pending_marks.extend(ms[: 2 - len(pending_marks)])
                 continue
 
-            # 馬名+印混在
             if ms:
                 pending_marks.extend(ms[: 2 - len(pending_marks)])
                 name_part = "".join(ch for ch in line if ch not in MARKS).strip()
@@ -268,13 +258,11 @@ def parse_analysis_article(article_url: str, track: str) -> Dict[int, List[dict]
                     pending_name_parts.append(name_part)
                 continue
 
-            # 馬名（続き）
             pending_name_parts.append(line)
             continue
 
         continue
 
-    # 最後の馬を確定
     if current_r is not None:
         flush_pending()
 
@@ -294,31 +282,44 @@ def get_umanari(track: str, date_ymd: Optional[str] = None) -> dict:
     return data
 
 
+# ===== 表整形 =====
 def pad2(n: int) -> str:
     return str(n).zfill(2)
 
 
-# ---- table format helpers ----
-def format_race_table(rows: List[dict]) -> str:
+def format_race_table(rows: List[dict], mode: str = "両方") -> str:
     """
-    なるべく等幅っぽく見えるように。
-    ※日本語は完全には揃わないけど、LINE表示ではかなり見やすい部類。
+    mode: 両方 / 勝率 / 爆走
     """
-    # 馬名カラム幅（長すぎると崩れるので上限）
-    name_w = 12
-
+    name_w = 12  # 目安（長すぎると崩れるので）
     lines = []
-    lines.append("No  馬名            勝  爆")
-    lines.append("--  --------------  --  --")
+    if mode == "勝率":
+        lines.append("No  馬名            勝")
+        lines.append("--  --------------  --")
+    elif mode == "爆走":
+        lines.append("No  馬名            爆")
+        lines.append("--  --------------  --")
+    else:
+        lines.append("No  馬名            勝  爆")
+        lines.append("--  --------------  --  --")
+
     for r in rows:
         no = pad2(r["no"])
         name = r["name"]
         if len(name) > name_w:
             name = name[: name_w - 1] + "…"
-        name = name.ljust(14)  # 目安
+        name = name.ljust(14)
+
         win = (r.get("win") or "–")
         bak = (r.get("bakusou") or "–")
-        lines.append(f"{no}  {name}  {win}   {bak}")
+
+        if mode == "勝率":
+            lines.append(f"{no}  {name}  {win}")
+        elif mode == "爆走":
+            lines.append(f"{no}  {name}  {bak}")
+        else:
+            lines.append(f"{no}  {name}  {win}   {bak}")
+
     return "\n".join(lines)
 
 
@@ -328,14 +329,13 @@ def build_all_races_text(track: str, date_ymd: Optional[str], article_url: str, 
         title += f"  {date_ymd}"
     out = [title, article_url, ""]
 
-    # Rを昇順に
     for rno in sorted(races.keys()):
         rows = races.get(rno, [])
         if not rows:
             continue
         out.append(f"【{track}{rno}R】")
-        out.append(format_race_table(rows))
-        out.append("")  # 空行
+        out.append(format_race_table(rows, mode="両方"))
+        out.append("")
 
     if len(out) <= 3:
         out.append("該当データが見つかりませんでした（解析不可 or パースできず）。")
@@ -344,17 +344,12 @@ def build_all_races_text(track: str, date_ymd: Optional[str], article_url: str, 
 
 
 def split_for_line(text: str, max_len: int = 4400) -> List[str]:
-    """
-    返信を複数メッセージに分割（LINE上限対策）
-    目安：max_len 4400（ヘッダ等の余裕）
-    """
     if len(text) <= max_len:
         return [text]
 
     parts = []
     buf = []
     buf_len = 0
-
     for line in text.split("\n"):
         add = line + "\n"
         if buf_len + len(add) > max_len and buf:
@@ -363,22 +358,21 @@ def split_for_line(text: str, max_len: int = 4400) -> List[str]:
             buf_len = 0
         buf.append(add)
         buf_len += len(add)
-
     if buf:
         parts.append("".join(buf).rstrip())
-
     return parts
 
 
-# ---- command parsing ----
-def parse_text_command(text: str):
+# ===== コマンド解析（リッチメニューは「テキスト送信」でOK）=====
+def parse_text_command(text: str) -> Optional[dict]:
     """
-    テキストでも操作できるように（リッチメニューがメインでも保険）
     例：
+      うまなり 全 京都
+      うまなり 全 京都 2026-02-08
       うまなり 京都11
-      うまなり 京都 2026-02-08
-      うまなり 京都 2026-02-08 全
+      うまなり 東京5 爆走
     """
+    text = text.strip()
     if not text.startswith("うまなり"):
         return None
 
@@ -386,12 +380,17 @@ def parse_text_command(text: str):
     if not args:
         return {"mode": "help"}
 
-    # 全レース: "京都 2026-02-08" または "京都 2026-02-08 全"
-    m_all = re.match(r"^(京都|東京|中山|阪神|小倉|福島|新潟)\s+(\d{4}-\d{2}-\d{2})(\s+全)?$", args)
+    # 全レース（リッチメニュー向け）
+    m_all = re.match(r"^全\s*(京都|東京|中山|阪神|小倉|福島|新潟)(?:\s+(\d{4}-\d{2}-\d{2}))?$", args)
     if m_all:
         return {"mode": "all", "track": m_all.group(1), "date": m_all.group(2)}
 
-    # 単一R: "京都11" / "京都 11 爆走" / "京都11 勝率"
+    # 旧：全レース（互換）
+    m_all2 = re.match(r"^(京都|東京|中山|阪神|小倉|福島|新潟)\s+(\d{4}-\d{2}-\d{2})(\s+全)?$", args)
+    if m_all2:
+        return {"mode": "all", "track": m_all2.group(1), "date": m_all2.group(2)}
+
+    # 単一R
     m_one = re.match(r"^(京都|東京|中山|阪神|小倉|福島|新潟)\s*(\d{1,2})\s*(勝率|爆走)?$", args)
     if m_one:
         return {
@@ -404,36 +403,7 @@ def parse_text_command(text: str):
     return {"mode": "help"}
 
 
-def parse_postback_data(data: str) -> Optional[dict]:
-    """
-    Rich menu の postback.data 例：
-      umanari_all|date=2026-02-08|track=京都
-      umanari_all|track=京都   （date省略なら最新）
-    """
-    if not data:
-        return None
-
-    if not data.startswith("umanari_all"):
-        return None
-
-    # "umanari_all|k=v|k=v"
-    parts = data.split("|")
-    kv = {}
-    for p in parts[1:]:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            kv[k.strip()] = v.strip()
-
-    track = kv.get("track")
-    date = kv.get("date")  # optional
-
-    if not track:
-        return None
-
-    return {"mode": "all", "track": track, "date": date}
-
-
-# ---- endpoints ----
+# ===== endpoints =====
 @APP.get("/")
 def health():
     return {"ok": True}
@@ -454,127 +424,78 @@ async def webhook(req: Request):
     events = payload.get("events", [])
 
     for ev in events:
-        et = ev.get("type")
+        if ev.get("type") != "message":
+            continue
 
-        # --- postback（リッチメニュー） ---
-        if et == "postback":
-            reply_token = ev.get("replyToken")
-            if not reply_token:
-                continue
+        msg = ev.get("message", {})
+        if msg.get("type") != "text":
+            continue
 
-            data = (ev.get("postback", {}) or {}).get("data", "")
-            cmd = parse_postback_data(data)
+        text_in = (msg.get("text") or "").strip()
+        reply_token = ev.get("replyToken")
+        if not reply_token:
+            continue
 
-            if not cmd:
-                line_reply(reply_token, "postback形式が不明です。data を確認してください。")
-                continue
+        cmd = parse_text_command(text_in)
+        if not cmd:
+            continue
 
+        if cmd["mode"] == "help":
+            line_reply(
+                reply_token,
+                "使い方：\n"
+                "・全R：うまなり 全 京都  /  うまなり 全 京都 2026-02-08\n"
+                "・単R：うまなり 京都11  /  うまなり 東京5 爆走"
+            )
+            continue
+
+        # 全R
+        if cmd["mode"] == "all":
             track = cmd["track"]
             date_ymd = cmd.get("date")
-
             try:
-                data = get_umanari(track, date_ymd=date_ymd)
-                article_url = data["article_url"]
-                races = data["races"]
+                d = get_umanari(track, date_ymd=date_ymd)
+                article_url = d["article_url"]
+                races = d["races"]
 
                 text = build_all_races_text(track, date_ymd, article_url, races)
                 chunks = split_for_line(text)
-
-                # LINE reply は最大5メッセージまで。超える分は切る（必要ならpushで送る設計に拡張可）
                 line_reply_texts(reply_token, chunks[:5])
 
             except Exception as e:
                 print("===== UMANARI ALL ERROR START =====")
-                print("postback data:", data)
                 print("track:", track, "date:", date_ymd)
                 print("error:", repr(e))
                 traceback.print_exc()
                 print("===== UMANARI ALL ERROR END =====")
                 line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
-
             continue
 
-        # --- message（手打ちコマンド） ---
-        if et == "message":
-            msg = ev.get("message", {})
-            if msg.get("type") != "text":
-                continue
+        # 単R
+        if cmd["mode"] == "race":
+            track = cmd["track"]
+            race_no = cmd["race"]
+            pick = cmd["pick"]
+            try:
+                d = get_umanari(track, date_ymd=None)
+                article_url = d["article_url"]
+                rows = d["races"].get(race_no, [])
 
-            text_in = (msg.get("text") or "").strip()
-            reply_token = ev.get("replyToken")
-            if not reply_token:
-                continue
+                if not rows:
+                    line_reply(reply_token, f"{track}{race_no}Rのデータが見つかりません。\n出典: {article_url}")
+                    continue
 
-            cmd = parse_text_command(text_in)
-            if not cmd:
-                continue
+                header = [f"{track}{race_no}R（出典）", article_url, ""]
+                table = format_race_table(rows, mode=pick if pick in ("勝率", "爆走") else "両方")
+                line_reply(reply_token, "\n".join(header) + table)
 
-            if cmd["mode"] == "help":
-                line_reply(
-                    reply_token,
-                    "使い方：\n"
-                    "・単R：うまなり 京都11 / うまなり 東京5 爆走 / うまなり 小倉9 勝率\n"
-                    "・全R：うまなり 京都 2026-02-08\n"
-                    "（リッチメニューがある場合はそちら推奨）"
-                )
-                continue
-
-            # 単R
-            if cmd["mode"] == "race":
-                track = cmd["track"]
-                race_no = cmd["race"]
-                pick = cmd["pick"]
-                try:
-                    data = get_umanari(track, date_ymd=None)
-                    article_url = data["article_url"]
-                    rows = data["races"].get(race_no, [])
-
-                    if not rows:
-                        line_reply(reply_token, f"{track}{race_no}Rのデータが見つかりません。\n出典: {article_url}")
-                        continue
-
-                    # 単Rは表を返す
-                    header = [f"{track}{race_no}R（出典）", article_url, ""]
-                    # pickでフィルタ（勝率/爆走のみ）
-                    if pick == "勝率":
-                        table_rows = [{**r, "bakusou": ""} for r in rows]
-                    elif pick == "爆走":
-                        table_rows = [{**r, "win": ""} for r in rows]
-                    else:
-                        table_rows = rows
-
-                    body = format_race_table(table_rows)
-                    line_reply(reply_token, "\n".join(header) + body)
-
-                except Exception as e:
-                    print("===== UMANARI RACE ERROR START =====")
-                    print("track:", track, "race:", race_no, "pick:", pick)
-                    print("error:", repr(e))
-                    traceback.print_exc()
-                    print("===== UMANARI RACE ERROR END =====")
-                    line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
-                continue
-
-            # 全R（手打ち）
-            if cmd["mode"] == "all":
-                track = cmd["track"]
-                date_ymd = cmd.get("date")
-                try:
-                    data = get_umanari(track, date_ymd=date_ymd)
-                    article_url = data["article_url"]
-                    races = data["races"]
-
-                    text = build_all_races_text(track, date_ymd, article_url, races)
-                    chunks = split_for_line(text)
-                    line_reply_texts(reply_token, chunks[:5])
-
-                except Exception as e:
-                    print("===== UMANARI ALL(TEXT) ERROR START =====")
-                    print("track:", track, "date:", date_ymd)
-                    print("error:", repr(e))
-                    traceback.print_exc()
-                    print("===== UMANARI ALL(TEXT) ERROR END =====")
-                    line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
-                continue
+            except Exception as e:
+                print("===== UMANARI RACE ERROR START =====")
+                print("track:", track, "race:", race_no, "pick:", pick)
+                print("error:", repr(e))
+                traceback.print_exc()
+                print("===== UMANARI RACE ERROR END =====")
+                line_reply(reply_token, "取得に失敗しました。Render Logs を確認してください。")
+            continue
 
     return Response(content="OK", media_type="text/plain")
